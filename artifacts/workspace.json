@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid30808",
+  "B": "/home/dev/feedback/uid30808",
+  "sha": "f07763ff1543039cbbf2e79001ba2aa5008f996b",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "jpr5",
+    "repo": "ngrep",
+    "sha": "f07763ff1543039cbbf2e79001ba2aa5008f996b"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "ngrep",
+    "cloneUrl": "https://github.com/Rrr119/ngrep.git"
+  },
+  "at": "2026-11-20T16:47:46.888Z"
+}

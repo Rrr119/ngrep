@@ -456,3 +456,58 @@ U frontend(172.18.0.3):42371 -> 127.0.0.11:53
 U 127.0.0.11:53 -> frontend(172.18.0.3):42371
   .............backend.mystack_default..............172.18.0.5...
 ```
+
+## Five-tuple flow matching (`-Y`) and match-only output (`-o`)
+
+Sometimes the payload pattern alone is not selective enough: the same string
+may appear on many flows, and you only care about one specific conversation.
+`-Y` adds a five-tuple filter that is AND-combined with the payload match
+expression.  Its argument is a comma-separated
+`proto,src-ip,src-port,dst-ip,dst-port` list, and any field may be `*`
+(or empty) as a wildcard.
+
+* `ngrep -Y 'tcp,10.0.0.1,12345,10.0.0.2,80' 'user=admin'`
+
+Only packets of the exact TCP flow whose payload contains `user=admin` are
+displayed; the same payload on a reversed flow, a different port or a UDP
+datagram is ignored.
+
+* `ngrep -Y 'udp,*,*,8.8.8.8,53'`
+
+With no match expression, every UDP datagram sent to `8.8.8.8:53` is shown,
+regardless of source address or port.
+
+* `ngrep -Y '*,2001:db8::1,*,2001:db8::2,*' -I capture.pcap`
+
+IPv6 addresses are accepted directly; a wildcarded protocol matches TCP, UDP
+and ICMPv6 alike.
+
+The flow filter stacks with every existing option, including `-v` (invert),
+`-X` (hexadecimal match) and a normal BPF filter:
+
+* `ngrep -v -Y 'tcp,10.0.0.1,12345,10.0.0.2,80' 'user=admin'`
+* `ngrep -Y 'udp,192.168.1.10,*,8.8.8.8,53' '' 'udp and port 53'`
+
+`-o` switches the payload display to grep-style "only matching" output.
+Each match is printed on its own line with its byte offset and length, and
+regular-expression capture groups are reported individually:
+
+```
+# ngrep -qo 'secret=([a-z0-9]+)' -I capture.pcap
+
+U 192.168.1.10:53001 -> 8.8.8.8:53 #2
+match[0:14]: secret=hunter2
+  group[1][7:7]: hunter2
+match[19:14]: secret=hunter3
+  group[1][26:7]: hunter3
+```
+
+`-o` also works with `-X` binary matching; non-printable bytes are escaped
+as `\xhh`:
+
+* `ngrep -Xo 'deadbeef' -I capture.pcap`
+
+Combining both features gives a precise "show me only the matching bytes on
+this exact conversation" query:
+
+* `ngrep -Y 'udp,2001:db8::1,*,2001:db8::2,53' -Xo 'deadbeef' -I capture.pcap`

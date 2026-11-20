@@ -34,6 +34,9 @@ REGEX_DIR=@REGEX_DIR@
 
 all: $(TARGET)
 
+check: $(TARGET)
+	@./tests/run_tests.sh
+
 $(TARGET): debug
 	$(STRIP) $(TARGET)
 

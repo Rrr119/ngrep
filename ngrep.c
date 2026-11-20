@@ -142,6 +142,22 @@ uint8_t  invert_match = 0, bin_match = 0;
 uint8_t  live_read = 1, want_delay = 0;
 uint8_t  dont_dropprivs = 0;
 uint8_t  enable_hilite = 0;
+uint8_t  only_matching = 0;
+
+/*
+ * Optional five-tuple flow filter (-Y).  Any field left as a wildcard
+ * (port == 0 / proto == 0 / ip[0] == '\0') matches every packet.
+ */
+typedef struct flow_filter_s {
+    uint8_t  active;
+    uint8_t  proto;
+    char     src_ip[INET6_ADDRSTRLEN + 1];
+    char     dst_ip[INET6_ADDRSTRLEN + 1];
+    uint16_t src_port;
+    uint16_t dst_port;
+} flow_filter_t;
+
+flow_filter_t flow_filter;
 
 char *read_file = NULL, *dump_file = NULL;
 char *usedev = NULL;
@@ -259,7 +275,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    while ((c = getopt(argc, argv, "LNhXViwqpevxlDtTRMK:Cs:n:c:d:A:I:O:S:P:F:W:ur")) != EOF) {
+    while ((c = getopt(argc, argv, "LNhXViwqpevxlDtTRMK:Cs:n:c:d:A:I:O:S:P:F:W:uroY:")) != EOF) {
         switch (c) {
             case 'W': {
                 if (!strcasecmp(optarg, "normal"))
@@ -283,6 +299,13 @@ int main(int argc, char **argv) {
 
             case 'F':
                 filter_file = optarg;
+                break;
+            case 'Y':
+                if (setup_flow_filter(optarg))
+                    usage();
+                break;
+            case 'o':
+                only_matching = 1;
                 break;
             case 'P':
                 nonprint_char = *optarg;
@@ -473,6 +496,9 @@ int main(int argc, char **argv) {
             printf("filter: %s\n", filter);
         free(filter);
     }
+
+    if (flow_filter.active && quiet < 2)
+        printf("flow: %s\n", flow_filter_string());
 
     /* Setup matcher */
 
@@ -1012,6 +1038,9 @@ void dump_packet(struct pcap_pkthdr *h, u_char *p, uint8_t proto, unsigned char 
     if (len > limitlen)
         len = limitlen;
 
+    if (flow_filter.active && !flow_match(proto, ip_src, ip_dst, sport, dport) && !keep_matching)
+        return;
+
     if ((len > 0 && match_func(data, len, &match_index, &match_size) == invert_match) && !keep_matching)
         return;
 
@@ -1096,12 +1125,323 @@ void dump_packet(struct pcap_pkthdr *h, u_char *p, uint8_t proto, unsigned char 
     else
         printf(" #%u\n", seen_frames);
 
-    if (quiet < 3)
+    if (quiet < 3 && only_matching)
+        dump_only_matches(data, len);
+    else if (quiet < 3)
         dump_func(data, len, match_index, match_size);
 
 #if USE_TCPKILL
     if (tcpkill_active)
         tcpkill_kill(h, p, link_offset, tcpkill_active);
+#endif
+}
+
+/*
+ * Five-tuple flow filtering (-Y).
+ *
+ * A flow spec is a comma-separated list of five fields, any of which may be
+ * the wildcard "*" (or empty):
+ *
+ *     proto,src-ip,src-port,dst-ip,dst-port
+ *
+ * e.g. "tcp,10.0.0.1,12345,10.0.0.2,80" or "udp,*,*,8.8.8.8,53".
+ * The flow filter ANDs with the payload match expression, BPF filter, -v and
+ * every other existing option.
+ */
+
+static uint8_t flow_parse_proto(const char *s, uint8_t *proto) {
+    if (!strcmp(s, "*") || !*s) {
+        *proto = 0;
+        return 1;
+    }
+    if (!strcasecmp(s, "tcp"))  { *proto = IPPROTO_TCP;    return 1; }
+    if (!strcasecmp(s, "udp"))  { *proto = IPPROTO_UDP;    return 1; }
+    if (!strcasecmp(s, "icmp")) { *proto = IPPROTO_ICMP;   return 1; }
+#if USE_IPv6
+    if (!strcasecmp(s, "icmpv6")) { *proto = IPPROTO_ICMPV6; return 1; }
+#endif
+    if (!strcasecmp(s, "igmp")) { *proto = IPPROTO_IGMP;   return 1; }
+
+    char *end;
+    unsigned long value = strtoul(s, &end, 10);
+    if (*end == '\0' && value > 0 && value <= 255) {
+        *proto = (uint8_t)value;
+        return 1;
+    }
+
+    return 0;
+}
+
+static uint8_t flow_parse_port(const char *s, uint16_t *port) {
+    if (!strcmp(s, "*") || !*s) {
+        *port = 0;
+        return 1;
+    }
+
+    char *end;
+    unsigned long value = strtoul(s, &end, 10);
+    if (*end != '\0' || value > 65535)
+        return 0;
+
+    *port = (uint16_t)value;
+    return 1;
+}
+
+static uint8_t flow_parse_ip(const char *s, char *out, size_t outlen) {
+    if (!strcmp(s, "*") || !*s) {
+        out[0] = '\0';
+        return 1;
+    }
+
+    /* Round-trip through inet_ntop() so comparisons use canonical text. */
+    struct in6_addr addr6;
+    char canonical[INET6_ADDRSTRLEN + 1];
+
+    if (inet_pton(AF_INET6, s, &addr6) == 1) {
+        if (!inet_ntop(AF_INET6, &addr6, canonical, sizeof(canonical)))
+            return 0;
+    } else {
+        struct in_addr addr4;
+
+        if (inet_pton(AF_INET, s, &addr4) != 1)
+            return 0;
+        if (!inet_ntop(AF_INET, &addr4, canonical, sizeof(canonical)))
+            return 0;
+    }
+
+    if (strlen(canonical) >= outlen)
+        return 0;
+
+    strcpy(out, canonical);
+    return 1;
+}
+
+int setup_flow_filter(char *spec) {
+    char buf[256];
+    char *fields[5];
+    char *token;
+    uint32_t count = 0;
+
+    if (strlen(spec) >= sizeof(buf)) {
+        fprintf(stderr, "fatal: flow filter specification too long\n");
+        return 1;
+    }
+    strcpy(buf, spec);
+
+    memset(&flow_filter, 0, sizeof(flow_filter));
+
+    token = strtok(buf, ",");
+    while (token && count < 5) {
+        fields[count++] = token;
+        token = strtok(NULL, ",");
+    }
+
+    if (count != 5 || token) {
+        fprintf(stderr,
+                "fatal: flow filter requires 5 comma-separated fields: "
+                "proto,src-ip,src-port,dst-ip,dst-port\n");
+        return 1;
+    }
+
+    if (!flow_parse_proto(fields[0], &flow_filter.proto) ||
+        !flow_parse_ip(fields[1], flow_filter.src_ip, sizeof(flow_filter.src_ip)) ||
+        !flow_parse_port(fields[2], &flow_filter.src_port) ||
+        !flow_parse_ip(fields[3], flow_filter.dst_ip, sizeof(flow_filter.dst_ip)) ||
+        !flow_parse_port(fields[4], &flow_filter.dst_port)) {
+        fprintf(stderr, "fatal: invalid flow filter specification '%s'\n", spec);
+        return 1;
+    }
+
+    flow_filter.active = 1;
+    return 0;
+}
+
+int flow_match(uint8_t proto, const char *ip_src, const char *ip_dst,
+               uint16_t sport, uint16_t dport) {
+    if (flow_filter.proto && flow_filter.proto != proto)
+        return 0;
+
+    if (flow_filter.src_ip[0] && strcmp(flow_filter.src_ip, ip_src))
+        return 0;
+
+    if (flow_filter.dst_ip[0] && strcmp(flow_filter.dst_ip, ip_dst))
+        return 0;
+
+    /* Ports are only meaningful for the transport protocols. */
+    if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+        if (flow_filter.src_port && flow_filter.src_port != sport)
+            return 0;
+        if (flow_filter.dst_port && flow_filter.dst_port != dport)
+            return 0;
+    }
+
+    return 1;
+}
+
+char *flow_filter_string(void) {
+    static char buf[256];
+    const char *proto;
+
+    switch (flow_filter.proto) {
+        case IPPROTO_TCP:    proto = "tcp";    break;
+        case IPPROTO_UDP:    proto = "udp";    break;
+        case IPPROTO_ICMP:   proto = "icmp";   break;
+#if USE_IPv6
+        case IPPROTO_ICMPV6: proto = "icmpv6"; break;
+#endif
+        case IPPROTO_IGMP:   proto = "igmp";   break;
+        case 0:              proto = "*";      break;
+        default: {
+            static char numbuf[8];
+            snprintf(numbuf, sizeof(numbuf), "%u", flow_filter.proto);
+            proto = numbuf;
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "%s,%s,%u,%s,%u",
+             proto,
+             flow_filter.src_ip[0] ? flow_filter.src_ip : "*",
+             flow_filter.src_port,
+             flow_filter.dst_ip[0] ? flow_filter.dst_ip : "*",
+             flow_filter.dst_port);
+
+    return buf;
+}
+
+/*
+ * -o ("only matching") output: print every regex/binary match inside the
+ * payload along with its byte offset and length, plus any capture groups.
+ */
+
+static void print_match_text(unsigned char *data, uint32_t start, uint32_t size) {
+    uint32_t i;
+
+    for (i = 0; i < size; i++) {
+        unsigned char ch = data[start + i];
+
+        if (ch == '\\')
+            printf("\\\\");
+        else if (isprint(ch))
+            printf("%c", ch);
+        else
+            printf("\\x%02x", ch);
+    }
+}
+
+static void print_match_record(unsigned char *data, uint32_t start, uint32_t size,
+                               uint32_t group, int is_group) {
+    if (is_group)
+        printf("  group[%u][%u:%u]: ", group, start, size);
+    else
+        printf("match[%u:%u]: ", start, size);
+
+    print_match_text(data, start, size);
+    printf("\n");
+}
+
+#if USE_PCRE2
+static void dump_only_matches_pcre2(unsigned char *data, uint32_t len) {
+    PCRE2_SIZE start = 0;
+    int rc;
+
+    while (start <= len) {
+        if (pcre2_jit_on)
+            rc = pcre2_jit_match(re, data, len, start, 0, pcre2_md, NULL);
+        else
+            rc = pcre2_match(re, data, len, start, 0, pcre2_md, NULL);
+
+        if (rc == PCRE2_ERROR_NOMATCH)
+            break;
+        if (rc < 0) {
+            PCRE2_UCHAR errbuf[256];
+            pcre2_get_error_message(rc, errbuf, sizeof(errbuf));
+            fprintf(stderr, "she's dead, jim: %s (error %d)\n", errbuf, rc);
+            clean_exit(2);
+        }
+
+        PCRE2_SIZE *ovector = pcre2_get_ovector_pointer(pcre2_md);
+        uint32_t mstart = (uint32_t)ovector[0];
+        uint32_t mend   = (uint32_t)ovector[1];
+
+        if (mend > mstart) {
+            print_match_record(data, mstart, mend - mstart, 0, 0);
+
+            for (int group = 1; group < rc; group++) {
+                if (ovector[2 * group] != PCRE2_UNSET)
+                    print_match_record(data,
+                                       (uint32_t)ovector[2 * group],
+                                       (uint32_t)(ovector[2 * group + 1] - ovector[2 * group]),
+                                       group, 1);
+            }
+        }
+
+        /* Always make forward progress, skipping zero-length matches. */
+        start = (mend == start) ? start + 1 : mend;
+    }
+}
+#else
+static void dump_only_matches_gnu(unsigned char *data, uint32_t len) {
+    static struct re_registers regs;
+    int32_t start = 0;
+
+    while (start <= (int32_t)len) {
+        int rc = re_search(&pattern, (char const *)data, (int32_t)len,
+                           start, len - start, &regs);
+
+        if (rc == -1)
+            break;
+        if (rc == -2) {
+            perror("she's dead, jim\n");
+            clean_exit(2);
+        }
+
+        uint32_t mstart = (uint32_t)regs.start[0];
+        uint32_t mend   = (uint32_t)regs.end[0];
+
+        if (mend > mstart) {
+            print_match_record(data, mstart, mend - mstart, 0, 0);
+
+            for (uint32_t group = 1; group < regs.num_regs; group++) {
+                if (regs.start[group] != -1)
+                    print_match_record(data,
+                                       (uint32_t)regs.start[group],
+                                       (uint32_t)(regs.end[group] - regs.start[group]),
+                                       group, 1);
+            }
+        }
+
+        /* Always make forward progress, skipping zero-length matches. */
+        start = ((int32_t)mend == start) ? start + 1 : (int32_t)mend;
+    }
+}
+#endif
+
+static void dump_only_matches_binary(unsigned char *data, uint32_t len) {
+    int32_t stop = (int32_t)len - match_len;
+    uint32_t i = 0;
+
+    if (stop < 0)
+        return;
+
+    while (i <= (uint32_t)stop) {
+        if (!memcmp(data + i, bin_data, match_len))
+            print_match_record(data, i, match_len, 0, 0);
+        i++;
+    }
+}
+
+void dump_only_matches(unsigned char *data, uint32_t len) {
+    if (match_func == blank_match_func)
+        return;
+
+    if (match_func == bin_match_func)
+        dump_only_matches_binary(data, len);
+#if USE_PCRE2
+    else
+        dump_only_matches_pcre2(data, len);
+#else
+    else
+        dump_only_matches_gnu(data, len);
 #endif
 }
 
@@ -1645,7 +1985,7 @@ void usage(void) {
 #if defined(_WIN32) || defined(_WIN64)
            "L"
 #endif
-           "hNXViwqpevxlDtTRMCu> <-IO pcap_dump> <-n num> <-d dev> <-A num>\n"
+           "hNXViwqpevxlDtTRMCuo> <-Y flow> <-IO pcap_dump> <-n num> <-d dev> <-A num>\n"
            "             <-s snaplen> <-S limitlen> <-W normal|byline|single|none> <-c cols>\n"
            "             <-P char> <-F file>"
 #if USE_TCPKILL
@@ -1683,6 +2023,9 @@ void usage(void) {
            "   -c  is force the column width to the specified size\n"
            "   -C  is colorize matches in packet contents output\n"
            "   -u  is show payload as UTF-8 characters\n"
+           "   -o  is print only the matched (non-empty) parts of a payload, one per line\n"
+           "   -Y  is restrict matches to a five-tuple flow \"proto,src-ip,src-port,dst-ip,dst-port\"\n"
+           "         (\"*\" or an empty field is a wildcard; e.g. tcp,10.0.0.1,*,10.0.0.2,80)\n"
            "   -P  is set the non-printable display char to what is specified\n"
            "   -F  is read the bpf filter from the specified file\n"
            "   -N  is show sub protocol number\n"

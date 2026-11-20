@@ -9,6 +9,7 @@ common packet sniffing tools, such as tcpdump and snoop.
 
 ## What's New
 
+ * Five-tuple flow filtering (`-Y`) AND-combined with payload matching, plus grep-style "only matching" output with offsets and capture groups (`-o`)
  * Container name resolution for Docker/Podman (`-r` flag)
  * Support display of UTF8 data when `-u` is specified
  * Upgrade to PCRE2 (default on MacOS/homebrew and Windows builds)

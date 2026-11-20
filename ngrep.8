@@ -16,6 +16,8 @@ ngrep \- network grep
 .I pcap_dump
 .B > < -n
 .I num
+.B > < -Y
+.I flow
 .B > < -d
 .I dev
 .B > < -A
@@ -99,6 +101,43 @@ Colorize matches in packet contents output.
 
 .IP -u
 Display UTF-8 characters in packet contents output.
+
+.IP -o
+Print only the matched (non-empty) parts of each packet payload, one
+match per line, instead of the normal packet contents dump.  Every line
+is prefixed with its byte offset and length as
+.BR "match[offset:length]".
+When the regular expression contains capture groups, each group is
+printed on its own indented line as
+.BR "group[n][offset:length]".
+Multiple matches inside a single packet are all reported, and the option
+works with both regular expressions and hexadecimal
+.RB ( -X )
+match expressions.  Non-printable bytes are escaped as
+.BR \exx .
+
+.IP "-Y flow"
+Restrict matches to packets belonging to the specified five-tuple
+.IR flow ,
+which is a comma-separated list of five fields:
+.IR proto , src-ip , src-port , dst-ip , dst-port .
+Any field may be the wildcard
+.B *
+(or left empty).  The protocol may be a name
+.RB ( tcp , udp , icmp , icmpv6 , igmp )
+or its numeric value; IP addresses accept IPv4 and IPv6 notation and
+are compared canonically.  For example,
+.B
+.nf
+  -Y tcp,10.0.0.1,12345,10.0.0.2,80
+  -Y udp,*,*,8.8.8.8,53
+  -Y *,2001:db8::1,*,2001:db8::2,*
+.fi
+.B
+The flow filter is combined (logical AND) with the payload match
+expression, the BPF filter and all other options, including
+.B -v
+(invert match).  Port fields are only evaluated for TCP and UDP.
 
 .IP -D
 When reading pcap_dump files, replay them at their recorded time
@@ -211,6 +250,15 @@ An extended regular expression follows the rules as implemented by the
 .BR library .
 Hexadecimal expressions can optionally be preceded by `0x'.  E.g.,
 `DEADBEEF', `0xDEADBEEF'.
+
+.IP "\fIflow filter\fP"
+When the \fI-Y\fP option is supplied, a packet is only considered when
+both its five-tuple (protocol, source/destination IP address and
+source/destination port) matches the flow specification \fIand\fP its
+payload satisfies the match expression.  The two filters are therefore
+combined as a logical AND; see \fI-Y\fP above for the field syntax.
+Use \fI-o\fP to print just the matching payload substrings instead of
+the full packet contents.
 
 .IP "\fI bpf filter\fP"
 Selects a filter that specifies what packets will be dumped.  If no

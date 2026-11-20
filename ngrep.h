@@ -114,6 +114,9 @@ typedef enum {
 int setup_pcap_source(char *);
 int setup_bpf_filter(char **);
 int setup_matcher(void);
+int  setup_flow_filter(char *);
+int  flow_match(uint8_t, const char *, const char *, uint16_t, uint16_t);
+char *flow_filter_string(void);
 
 void process(u_char *, struct pcap_pkthdr *, u_char *);
 
@@ -136,6 +139,8 @@ void dump_delay_proc     (struct pcap_pkthdr *);
 int8_t re_match_func   (unsigned char *, uint32_t, uint16_t *, uint16_t *);
 int8_t bin_match_func  (unsigned char *, uint32_t, uint16_t *, uint16_t *);
 int8_t blank_match_func(unsigned char *, uint32_t, uint16_t *, uint16_t *);
+
+void dump_only_matches(unsigned char *, uint32_t);
 
 void print_time_absolute(struct pcap_pkthdr *);
 void print_time_diff    (struct pcap_pkthdr *);
